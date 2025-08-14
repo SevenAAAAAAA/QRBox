@@ -1,0 +1,7 @@
+${PODS_ROOT}/Target Support Files/Pods-QRBox/Pods-QRBox-resources.sh
+${PODS_CONFIGURATION_BUILD_DIR}/AFNetworking/AFNetworking.bundle
+${PODS_CONFIGURATION_BUILD_DIR}/SDWebImage/SDWebImage.bundle
+${PODS_ROOT}/SGQRCode/SGQRCode/SGQRCode.bundle
+${PODS_ROOT}/SVProgressHUD/SVProgressHUD/SVProgressHUD.bundle
+${PODS_ROOT}/SVProgressHUD/SVProgressHUD/PrivacyInfo.xcprivacy
+${PODS_CONFIGURATION_BUILD_DIR}/Toast/Toast.bundle

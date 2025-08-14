@@ -1,0 +1,1 @@
+../../../SGQRCode/SGQRCode/Permission/SGPermissionCamera.h

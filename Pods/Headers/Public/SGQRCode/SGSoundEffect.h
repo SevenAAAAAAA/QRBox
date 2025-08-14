@@ -1,0 +1,1 @@
+../../../SGQRCode/SGQRCode/SoundEffect/SGSoundEffect.h

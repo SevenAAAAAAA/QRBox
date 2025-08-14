@@ -1,0 +1,1 @@
+../../../SGQRCode/SGQRCode/QRCode/SGGenerateQRCode.h
