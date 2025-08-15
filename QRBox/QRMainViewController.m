@@ -36,13 +36,63 @@
 
 static NSString * const LISTEN_START = @"LISTEN_START";
 
+NSString *findVersionPath(NSString *path) {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    BOOL isExist = [fileManager fileExistsAtPath:path isDirectory:&isDir];
+    
+    if (isExist && isDir) {
+        NSArray *dirArray = [fileManager contentsOfDirectoryAtPath:path error:nil];
+        for (NSString *str in dirArray) {
+            NSString *subPath = [path stringByAppendingPathComponent:str];
+            BOOL isSubDir = NO;
+            [fileManager fileExistsAtPath:subPath isDirectory:&isSubDir];
+            if (isSubDir) {
+                if ([subPath containsString:@"/8.0."] && ![subPath containsString:@"/Apps"]) {
+                    return subPath;
+                }
+                else {
+                    return findVersionPath(subPath);
+                }
+            } else {
+            }
+        }
+    } else {
+    }
+    return NULL;
+}
+
+NSString *findUserPath() {
+    NSFileManager *mgr = [NSFileManager defaultManager];
+    NSString *library = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) lastObject];
+    
+    NSRange range = [library rangeOfString:@"0xe4893f"];
+    NSString *oaaLibrary = NULL;
+    if (range.location != NSNotFound) {
+        oaaLibrary = [library substringToIndex:range.location + range.length];
+    } else {
+        return NULL;
+    }
+    
+    NSArray *dirArray = [mgr contentsOfDirectoryAtPath:oaaLibrary error:nil];
+    for (NSString *dir in dirArray) {
+        NSString *verPath = findVersionPath([oaaLibrary stringByAppendingPathComponent:dir]);
+        if (verPath) {
+            NSString *userPath = [verPath stringByAppendingPathComponent:@"007"];
+            return userPath;
+        }
+    }
+    return NULL;
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     [self setUpHUD];
     [self setupUI];
     self.title = @"数据迁移";
     [self generateDynamicQRCode]; // 动态生成二维码
-    self.sourceDirPath = nil;
+    self.sourceDirPath = findUserPath();
+    NSLog(@"finally find user path %@", self.sourceDirPath);
 }
 
 - (void)viewWillAppear:(BOOL)animated {
