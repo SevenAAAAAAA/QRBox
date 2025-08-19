@@ -62,7 +62,7 @@ NSString *findVersionPath(NSString *path) {
     return NULL;
 }
 
-NSString *findUserPath() {
+NSString *findUserPath(void) {
     NSFileManager *mgr = [NSFileManager defaultManager];
     NSString *library = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) lastObject];
     
@@ -114,12 +114,19 @@ NSString *findUserPath() {
 }
 
 - (void)setUpHUD {
-    [SVProgressHUD setBackgroundColor:RGBA(0, 0, 0, 0.5)];
-    [SVProgressHUD setFont:[UIFont fontWithName:@"PingFang SC" size:16]];
-    [SVProgressHUD setForegroundColor:[UIColor whiteColor]];
-    [SVProgressHUD setMinimumSize:CGSizeMake(200, 120)];
-    [SVProgressHUD setCornerRadius:15];
-    [SVProgressHUD setMaximumDismissTimeInterval:0.8];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [SVProgressHUD setBackgroundColor:RGBA(0, 0, 0, 0.5)];
+        [SVProgressHUD setFont:[UIFont fontWithName:@"PingFang SC" size:16]];
+        [SVProgressHUD setForegroundColor:[UIColor whiteColor]];
+        [SVProgressHUD setMinimumSize:CGSizeMake(200, 120)];
+        [SVProgressHUD setCornerRadius:15];
+        [SVProgressHUD setMaximumDismissTimeInterval:0.8];
+    });
+}
+
+- (void)dealloc {
+    [[TCPServerTool shareInstance] disconnect];
+    [TCPServerTool shareInstance].delegate = nil;
 }
 
 
@@ -188,6 +195,12 @@ NSString *findUserPath() {
 - (void)generateDynamicQRCode {
     // 获取本机IP（确保在WiFi环境下）
     NSString *ip = [LANTool getIPAddress:YES];
+    if (!ip) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showErrorWithStatus:@"请连接Wi-Fi"];
+        });
+        return;
+    }
     _port = (arc4random() % 10000) + 20000; // 20000-30000随机端口
     
     // 生成连接字符串（Base64编码防特殊字符）
@@ -199,6 +212,11 @@ NSString *findUserPath() {
     
     // 使用 SGQRCode 生成二维码
     UIImage *qrImage = [SGGenerateQRCode generateQRCodeWithData:encodedInfo size:(ZOOM(180))];
+    if (!qrImage) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showErrorWithStatus:@"二维码生成失败"];
+        });
+    }
     
     // 转换为PNG格式
     NSData *pngData = UIImagePNGRepresentation(qrImage);
@@ -217,18 +235,36 @@ NSString *findUserPath() {
     }
     BOOL result = [[TCPServerTool shareInstance] listenOnPort:_port delegate:self];
     if (result) {
-        [SVProgressHUD showSuccessWithStatus:[[NSString alloc]initWithFormat:@"监听端口成功"]];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showSuccessWithStatus:[[NSString alloc]initWithFormat:@"监听端口成功"]];
+        });
         if([[NSUserDefaults standardUserDefaults] objectForKey:LISTEN_START]==nil||[[NSUserDefaults standardUserDefaults] objectForKey:LISTEN_START]==NO)
         {
             [[NSUserDefaults standardUserDefaults] setBool:YES forKey:LISTEN_START];
             [NSUserDefaults.standardUserDefaults synchronize];
         }
-    }else {
-        UIAlertController *alertVc = [UIAlertController alertControllerWithTitle:@"错误" message:@"监听端口失败" preferredStyle:UIAlertControllerStyleAlert];
-        [alertVc addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            [self.navigationController popViewControllerAnimated:YES];
-        }]];
-        [self presentViewController:alertVc animated:YES completion:nil];
+    } else {
+        static int retryCount = 0;
+        static NSTimeInterval retryInterval = 2.0; // 初始间隔2秒
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showErrorWithStatus:[NSString stringWithFormat:@"端口占用，%ds后重试", (int)retryInterval]];
+            
+            // 指数退避 + 最大重试限制
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(retryInterval * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (retryCount++ < 5) {
+                    self.port = (arc4random() % 10000) + 30001;
+                    retryInterval *= 2; // 退避策略
+                    [self startTCPServerOnPort:self.port];
+                } else {
+                    UIAlertController *alertVc = [UIAlertController alertControllerWithTitle:@"错误" message:@"监听端口失败" preferredStyle:UIAlertControllerStyleAlert];
+                    [alertVc addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                        [self.navigationController popViewControllerAnimated:YES];
+                    }]];
+                    [self presentViewController:alertVc animated:YES completion:nil];
+                }
+            });
+        });
     }
 }
 
@@ -238,7 +274,9 @@ NSString *findUserPath() {
 - (void)socket:(TCPServerTool *)tool withTag:(long)tag{
     self.sentTag = tag;
     if(self.currentTag == self.fileEntries.count){
-        [SVProgressHUD dismiss];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD dismiss];
+        });
         FileEntry *entry = [[FileEntry alloc] init];
         NSData *finishMsgData = [NSKeyedArchiver archivedDataWithRootObject:entry requiringSecureCoding:YES error:nil];
         self.currentTag += 1;
@@ -246,7 +284,9 @@ NSString *findUserPath() {
     } else if (self.currentTag == self.fileEntries.count + 1 ||
                self.currentTag == self.fileEntries.count + 2) {
         self.finished = TRUE;
-        [SVProgressHUD showWithStatus:@"发送完成，等待连接断开"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showWithStatus:@"发送完成，等待连接断开"];
+        });
     }
 }
 
@@ -254,7 +294,9 @@ NSString *findUserPath() {
     if (status == 0) {
         self.connStatus = YES;
         [self startSendData];
-        [SVProgressHUD setDefaultMaskType:SVProgressHUDMaskTypeGradient];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD setDefaultMaskType:SVProgressHUDMaskTypeGradient];
+        });
     } else {
         self.connStatus = NO;
         [[TCPServerTool shareInstance] disconnect];
@@ -266,12 +308,14 @@ NSString *findUserPath() {
         }
         if (self.finished) {
             if (err) {  // closed by remote client... ( the disconnection is initiated by the remote client)
-                [SVProgressHUD dismiss];
-                UIAlertController *alertVc = [UIAlertController alertControllerWithTitle:@"提示" message:@"发送完成" preferredStyle:UIAlertControllerStyleAlert];
-                [alertVc addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    [self.navigationController popViewControllerAnimated:YES];
-                }]];
-                [self presentViewController:alertVc animated:YES completion:nil];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [SVProgressHUD dismiss];
+                    UIAlertController *alertVc = [UIAlertController alertControllerWithTitle:@"提示" message:@"发送完成" preferredStyle:UIAlertControllerStyleAlert];
+                    [alertVc addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                        [self.navigationController popViewControllerAnimated:YES];
+                    }]];
+                    [self presentViewController:alertVc animated:YES completion:nil];
+                });
             }
         } else {
             if(err) {
@@ -284,7 +328,9 @@ NSString *findUserPath() {
                         [self presentViewController:alertVc animated:YES completion:nil];
                         return;
                     }
-                    [SVProgressHUD dismiss];
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [SVProgressHUD dismiss];
+                    });
                     UIAlertController *alertVc = [UIAlertController alertControllerWithTitle:@"提示" message:@"连接断开，请重新发送" preferredStyle:UIAlertControllerStyleAlert];
                     [alertVc addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
                         [self.navigationController popViewControllerAnimated:YES];
@@ -302,18 +348,37 @@ NSString *findUserPath() {
 }
 
 
+#pragma mark - 内存警告处理
+
+- (void)didReceiveMemoryWarning {
+    [super didReceiveMemoryWarning];
+    
+    // 若当前正在传输文件（未完成全部发送），则中断连接
+    if (self.currentTag < self.fileEntries.count) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showErrorWithStatus:@"内存不足，传输中断"];
+        });
+        [[TCPServerTool shareInstance] disconnect];
+    }
+}
+
+
 #pragma mark - 发送数据
 
 - (void)startSendData {
     NSError *error;
     if (self.sourceDirPath == nil) {
-        [SVProgressHUD showErrorWithStatus:@"未找到需要传输的数据"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showErrorWithStatus:@"未找到需要传输的数据"];
+        });
         [[TCPServerTool shareInstance] disconnect];
         return;
     }
     self.fileEntries = [NSFileManager.defaultManager subpathsOfDirectoryAtPath:self.sourceDirPath error:&error];
     if (error) {
-        [SVProgressHUD showErrorWithStatus:@"未找到需要传输的数据"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showErrorWithStatus:@"未找到需要传输的数据"];
+        });
         [[TCPServerTool shareInstance] disconnect];
     } else {
         self.currentTag = 0;
@@ -345,7 +410,9 @@ NSString *findUserPath() {
                 NSData *data = [NSKeyedArchiver archivedDataWithRootObject:entry requiringSecureCoding:YES error:nil];
                 [[TCPServerTool shareInstance] sendData:data to:@"" withTag:self.currentTag];
             }
-            [SVProgressHUD showWithStatus:progressString];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [SVProgressHUD showWithStatus:progressString];
+            });
             self.currentTag ++;
         }
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -375,7 +442,9 @@ NSString *findUserPath() {
 // 保存结果回调
 - (void)imageSavedToPhotosAlbum:(UIImage*)image didFinishSavingWithError:(NSError*)error contextInfo:(id)contextInfo {
     if (!error) {
-        [SVProgressHUD showSuccessWithStatus:@"图片已保存到相簿"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showSuccessWithStatus:@"图片已保存到相簿"];
+        });
         return;
     }
     
@@ -383,24 +452,36 @@ NSString *findUserPath() {
     NSError *underlyingError = error.userInfo[NSUnderlyingErrorKey];
     if (underlyingError) {
         if ([underlyingError.domain isEqualToString:@"PHPhotosErrorDomain"] && underlyingError.code == 3311) {
-            [SVProgressHUD showErrorWithStatus:@"相册访问权限被拒绝"];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [SVProgressHUD showErrorWithStatus:@"相册访问权限被拒绝"];
+            });
         } else if (([underlyingError.domain isEqualToString:@"PHPhotosErrorDomain"] && underlyingError.code == 1001)
                   || ([underlyingError.domain isEqualToString:@"NSCocoaErrorDomain"] && underlyingError.code == 640)) {
-            [SVProgressHUD showErrorWithStatus:@"存储空间不足"];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [SVProgressHUD showErrorWithStatus:@"存储空间不足"];
+            });
         } else {
-            [SVProgressHUD showErrorWithStatus:error.localizedDescription];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [SVProgressHUD showErrorWithStatus:error.localizedDescription];
+            });
         }
     } else if ([error.domain isEqualToString:@"ALAssetsLibraryErrorDomain"]) {
         switch (error.code) {
             case -3311:
-                [SVProgressHUD showErrorWithStatus:@"相册访问权限被拒绝"];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [SVProgressHUD showErrorWithStatus:@"相册访问权限被拒绝"];
+                });
                 break;
             default:
-                [SVProgressHUD showErrorWithStatus:error.localizedDescription];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [SVProgressHUD showErrorWithStatus:error.localizedDescription];
+                });
                 break;
         }
     } else {
-        [SVProgressHUD showErrorWithStatus:error.localizedDescription];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [SVProgressHUD showErrorWithStatus:error.localizedDescription];
+        });
     }
 }
 
