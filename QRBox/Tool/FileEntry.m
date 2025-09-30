@@ -9,29 +9,30 @@
 
 @implementation FileEntry
 
++ (BOOL)supportsSecureCoding {
+    return YES;
+}
+
 - (void)encodeWithCoder:(NSCoder *)aCoder {
+    [aCoder encodeInteger:self.type forKey:@"type"];
     [aCoder encodeObject:self.path forKey:@"path"];
+    [aCoder encodeInt64:self.fileSize forKey:@"fileSize"];
+    [aCoder encodeInt64:self.offset forKey:@"offset"];
+    [aCoder encodeObject:self.chunkData forKey:@"chunkData"];
     [aCoder encodeBool:self.isDir forKey:@"isDir"];
-    [aCoder encodeObject:self.data forKey:@"data"];
 }
 
 - (nullable instancetype)initWithCoder:(nonnull NSCoder *)aDecoder {
- 
     self = [super init];
     if (self) {
+        self.type = [aDecoder decodeIntegerForKey:@"type"];
         self.path = [aDecoder decodeObjectForKey:@"path"];
+        self.fileSize = [aDecoder decodeInt64ForKey:@"fileSize"];
+        self.offset = [aDecoder decodeInt64ForKey:@"offset"];
+        self.chunkData = [aDecoder decodeObjectForKey:@"chunkData"];
         self.isDir = [aDecoder decodeBoolForKey:@"isDir"];
-        self.data = [aDecoder decodeObjectForKey:@"data"];
     }
     return self;
-}
-
-- (NSData*)serialize{
-      return [NSKeyedArchiver archivedDataWithRootObject:self requiringSecureCoding:YES error:nil];
-}
-
-+ (BOOL)supportsSecureCoding {
-    return YES;
 }
 
 

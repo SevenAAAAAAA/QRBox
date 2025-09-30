@@ -80,9 +80,9 @@
             NSData *heartData = [NSData dataWithBytes:&hearBeat length:sizeof(hearBeat)];
             if ([realData isEqualToData:heartData]) {
                 if (kStringIsEmpty(sock.connectedHost)) {
-                    return;;
+                    return;
                 } else {
-                    //更新最新时间
+                    // 更新最新时间
                     self.heartDict[sock.connectedHost] = [NSDate date];
                 }
             } else {

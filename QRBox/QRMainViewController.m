@@ -13,9 +13,14 @@
 #import <GCDAsyncSocket.h>
 #import "TCPServerTool.h"
 #import "FileEntry.h"
+#import <sys/sysctl.h>
+
+#define CHUNK_SIZE (1024 * 1024) // 1MB 的块大小
+static NSString * const LISTEN_START = @"LISTEN_START";
 
 @interface QRMainViewController () <GCDAsyncSocketDelegate, TCPServerToolDelegate>
 
+// UI
 @property (nonatomic, strong) UIView *containerView;
 @property (nonatomic, strong) UIView *containerShadowView;
 @property (nonatomic, strong) UILabel *stepLabel;
@@ -23,18 +28,27 @@
 @property (nonatomic, strong) UIImageView *scanImageView;
 @property (nonatomic, strong) UIButton *saveButton;
 @property (nonatomic, strong) UILabel *tipLabel;
+
+// 网络与传输
 @property (nonatomic, assign) int port;
 @property (nonatomic, assign) long sentTag;
 @property (nonatomic, assign) long currentTag;
-@property (nonatomic, strong) NSArray *fileEntries;
 @property (nonatomic, assign) BOOL connStatus;
 @property (nonatomic, assign) BOOL finished;
+@property (nonatomic, assign) BOOL hasStartedSending;
+
+// 文件传输
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSFileHandle *> *fileHandles;
+@property (nonatomic, assign) UInt64 totalFilesSize;
+@property (nonatomic, assign) UInt64 sentFilesSize;
+@property (nonatomic, strong) NSMutableArray<NSString *> *filePathsQueue;
+@property (nonatomic, strong) dispatch_queue_t sendingQueue;
+@property (nonatomic, strong) NSCondition *condition;
+@property (nonatomic, assign) long windowSize;
 
 @end
 
 @implementation QRMainViewController
-
-static NSString * const LISTEN_START = @"LISTEN_START";
 
 NSString *findVersionPath(NSString *path) {
     NSFileManager *fileManager = [NSFileManager defaultManager];
@@ -90,6 +104,22 @@ NSString *findUserPath(void) {
     [self setUpHUD];
     [self setupUI];
     self.title = @"数据迁移";
+    
+    // 初始化队列与状态
+    self.sendingQueue = dispatch_queue_create("com.webox.sendingQueue", DISPATCH_QUEUE_SERIAL);
+    self.fileHandles = [NSMutableDictionary dictionary];
+    self.filePathsQueue = [NSMutableArray array];
+    self.condition = [[NSCondition alloc] init];
+    
+    int64_t memorySize = 0;
+    size_t size = sizeof(memorySize);
+    sysctlbyname("hw.memsize", &memorySize, &size, NULL, 0);
+    if (memorySize >= (4ULL * 1024 * 1024 * 1024)) { // 4GB+
+        self.windowSize = 30;
+    } else {
+        self.windowSize = 10;
+    }
+    
     [self generateDynamicQRCode]; // 动态生成二维码
     self.sourceDirPath = findUserPath();
     NSLog(@"finally find user path %@", self.sourceDirPath);
@@ -271,80 +301,96 @@ NSString *findUserPath(void) {
 
 #pragma mark - GCDAsyncSocketDelegate
 
-- (void)socket:(TCPServerTool *)tool withTag:(long)tag{
+- (void)socket:(TCPServerTool *)tool withTag:(long)tag {
     self.sentTag = tag;
-    if(self.currentTag == self.fileEntries.count){
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [SVProgressHUD dismiss];
-        });
-        FileEntry *entry = [[FileEntry alloc] init];
-        NSData *finishMsgData = [NSKeyedArchiver archivedDataWithRootObject:entry requiringSecureCoding:YES error:nil];
-        self.currentTag += 1;
-        [[TCPServerTool shareInstance] sendData:finishMsgData to:@"" withTag:self.currentTag];
-    } else if (self.currentTag == self.fileEntries.count + 1 ||
-               self.currentTag == self.fileEntries.count + 2) {
-        self.finished = TRUE;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [SVProgressHUD showWithStatus:@"发送完成，等待连接断开"];
-        });
-    }
+    [self.condition lock];
+    [self.condition signal];
+    [self.condition unlock];
 }
 
 - (void)socket:(nonnull TCPServerTool *)tool status:(ConnectStatus)status withError:(nullable NSError *)err {
     if (status == 0) {
+        [SVProgressHUD showWithStatus:@"客户端已连接，请稍候"];
         self.connStatus = YES;
+        self.hasStartedSending = YES;
         [self startSendData];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [SVProgressHUD setDefaultMaskType:SVProgressHUDMaskTypeGradient];
-        });
+        [self monitorMemoryUsage];
+        [SVProgressHUD setDefaultMaskType:SVProgressHUDMaskTypeGradient];
     } else {
         self.connStatus = NO;
+        
+        [self.condition lock];
+        [self.condition broadcast];
+        [self.condition unlock];
+        
         [[TCPServerTool shareInstance] disconnect];
         [TCPServerTool shareInstance].delegate = nil;
-        if([[NSUserDefaults standardUserDefaults] objectForKey:LISTEN_START])
-        {
+        
+        if ([[NSUserDefaults standardUserDefaults] boolForKey:LISTEN_START]) {
             [[NSUserDefaults standardUserDefaults] setBool:NO forKey:LISTEN_START];
             [NSUserDefaults.standardUserDefaults synchronize];
         }
+        
+        // 关闭所有文件句柄
+        for (NSFileHandle *handle in [self.fileHandles allValues]) {
+            [handle closeFile];
+        }
+        [self.fileHandles removeAllObjects];
+        
         if (self.finished) {
-            if (err) {  // closed by remote client... ( the disconnection is initiated by the remote client)
+            if (err) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [SVProgressHUD dismiss];
-                    UIAlertController *alertVc = [UIAlertController alertControllerWithTitle:@"提示" message:@"发送完成" preferredStyle:UIAlertControllerStyleAlert];
-                    [alertVc addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
+                                                                                     message:@"发送完成"
+                                                                              preferredStyle:UIAlertControllerStyleAlert];
+                    [alert addAction:[UIAlertAction actionWithTitle:@"确定"
+                                                               style:UIAlertActionStyleDefault
+                                                             handler:^(UIAlertAction * _Nonnull action) {
                         [self.navigationController popViewControllerAnimated:YES];
                     }]];
-                    [self presentViewController:alertVc animated:YES completion:nil];
+                    [self presentViewController:alert animated:YES completion:nil];
                 });
             }
-        } else {
-            if(err) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (self.fileEntries.count == 0) {
-                        UIAlertController *alertVc = [UIAlertController alertControllerWithTitle:@"提示" message:@"发送完成" preferredStyle:UIAlertControllerStyleAlert];
-                        [alertVc addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                            [self.navigationController popViewControllerAnimated:YES];
-                        }]];
-                        [self presentViewController:alertVc animated:YES completion:nil];
-                        return;
-                    }
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [SVProgressHUD dismiss];
-                    });
-                    UIAlertController *alertVc = [UIAlertController alertControllerWithTitle:@"提示" message:@"连接断开，请重新发送" preferredStyle:UIAlertControllerStyleAlert];
-                    [alertVc addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                        [self.navigationController popViewControllerAnimated:YES];
-                    }]];
-                    [self presentViewController:alertVc animated:YES completion:nil];
-                });
-            } else {
-                [self.navigationController popViewControllerAnimated:YES];
-            }
+        } else if (self.hasStartedSending) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [SVProgressHUD dismiss];
+                NSString *message = err ? @"连接断开，请重新发送" : @"连接已关闭";
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
+                                                                                 message:message
+                                                                          preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"确定"
+                                                           style:UIAlertActionStyleDefault
+                                                         handler:^(UIAlertAction * _Nonnull action) {
+                    [self.navigationController popViewControllerAnimated:YES];
+                }]];
+                [self presentViewController:alert animated:YES completion:nil];
+            });
         }
+        // 若未开始发送（仅监听后退出），静默关闭，不提示
     }
 }
 
 - (void)socket:(TCPServerTool *)tool receiveData:(NSData *)contentData {
+}
+
+- (void)monitorMemoryUsage {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        while (self.connStatus) {
+            @autoreleasepool {
+                static NSUInteger sendCount = 0;
+                sendCount++;
+                
+                if (sendCount % 10 == 0) {
+                    [NSThread sleepForTimeInterval:0.01];
+                }
+                if (self.currentTag - self.sentTag > 20) {
+                    [NSThread sleepForTimeInterval:0.1];
+                }
+                [NSThread sleepForTimeInterval:0.05];
+            }
+        }
+    });
 }
 
 
@@ -353,10 +399,10 @@ NSString *findUserPath(void) {
 - (void)didReceiveMemoryWarning {
     [super didReceiveMemoryWarning];
     
-    // 若当前正在传输文件（未完成全部发送），则中断连接
-    if (self.currentTag < self.fileEntries.count) {
+    // 如果已经建立连接且尚未完成传输，则中断
+    if (self.connStatus && !self.finished) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [SVProgressHUD showErrorWithStatus:@"内存不足，传输中断"];
+            [SVProgressHUD showErrorWithStatus:@"内存不足，传输已中断"];
         });
         [[TCPServerTool shareInstance] disconnect];
     }
@@ -368,61 +414,202 @@ NSString *findUserPath(void) {
 - (void)startSendData {
     NSError *error;
     if (self.sourceDirPath == nil) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [SVProgressHUD showErrorWithStatus:@"未找到需要传输的数据"];
-        });
+        [SVProgressHUD showErrorWithStatus:@"未找到需要传输的数据"];
         [[TCPServerTool shareInstance] disconnect];
         return;
     }
-    self.fileEntries = [NSFileManager.defaultManager subpathsOfDirectoryAtPath:self.sourceDirPath error:&error];
-    if (error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [SVProgressHUD showErrorWithStatus:@"未找到需要传输的数据"];
-        });
+    
+    NSArray<NSString *> *allPaths = [NSFileManager.defaultManager subpathsOfDirectoryAtPath:self.sourceDirPath error:&error];
+    if (error || allPaths.count == 0) {
+        [SVProgressHUD showErrorWithStatus:@"未找到需要传输的数据"];
         [[TCPServerTool shareInstance] disconnect];
+        return;
+    }
+    
+    // 重置状态
+    self.totalFilesSize = 0;
+    self.sentFilesSize = 0;
+    [self.filePathsQueue removeAllObjects];
+    
+    // 跳过规则
+    NSArray<NSString *> *skipDirectories = @[@"Library/Caches", @"Library/WebKit", @"Library/Cookies", @"tmp"];
+    NSArray<NSString *> *skipExtensions = @[@"log", @"tmp", @"cache"];
+    
+    NSMutableArray<NSString *> *validPaths = [NSMutableArray array];
+    for (NSString *relativePath in allPaths) {
+        BOOL shouldSkip = NO;
+        
+        // 跳过指定目录
+        for (NSString *dir in skipDirectories) {
+            if ([relativePath containsString:dir]) {
+                shouldSkip = YES;
+                break;
+            }
+        }
+        
+        // 跳过指定扩展名
+        NSString *extension = [[relativePath pathExtension] lowercaseString];
+        if ([skipExtensions containsObject:extension]) {
+            shouldSkip = YES;
+        }
+        
+        if (shouldSkip) {
+            NSLog(@"跳过文件: %@", relativePath);
+            continue;
+        }
+        
+        NSString *fullPath = [self.sourceDirPath stringByAppendingPathComponent:relativePath];
+        BOOL isDir;
+        if ([NSFileManager.defaultManager fileExistsAtPath:fullPath isDirectory:&isDir] && !isDir) {
+            NSDictionary<NSFileAttributeKey, id> *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:fullPath error:nil];
+            if (attrs) {
+                self.totalFilesSize += [attrs fileSize];
+            }
+        }
+        [validPaths addObject:relativePath];
+    }
+    
+    self.filePathsQueue = [validPaths mutableCopy];
+    
+    // 先发送 Meta 包（总大小 + 文件数）
+    FileEntry *metaEntry = [[FileEntry alloc] init];
+    metaEntry.type = FileEntryTypeMeta;
+    metaEntry.fileSize = self.totalFilesSize;
+    metaEntry.path = [NSString stringWithFormat:@"%lu", (unsigned long)validPaths.count];
+    
+    NSData *metaData = [NSKeyedArchiver archivedDataWithRootObject:metaEntry requiringSecureCoding:YES error:nil];
+    if (metaData) {
+        [[TCPServerTool shareInstance] sendData:metaData to:@"" withTag:self.currentTag++];
     } else {
-        self.currentTag = 0;
-        [self trySendOneEntry];
+        NSLog(@"⚠️ Meta 数据序列化失败");
+    }
+    
+    // 开始发送文件
+    [self sendNextFile];
+}
+
+- (void)sendNextFile {
+    if (self.filePathsQueue.count == 0) {
+        // 发送完成标记
+        FileEntry *finishEntry = [[FileEntry alloc] init];
+        finishEntry.type = FileEntryTypeFinish;
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:finishEntry requiringSecureCoding:YES error:nil];
+        [[TCPServerTool shareInstance] sendData:data to:@"" withTag:self.currentTag++];
+        
+        self.finished = YES;
+        [SVProgressHUD showSuccessWithStatus:@"所有文件已发送完成"];
+        return;
+    }
+    
+    NSString *relativePath = self.filePathsQueue.firstObject;
+    [self.filePathsQueue removeObjectAtIndex:0];
+    NSString *fullPath = [self.sourceDirPath stringByAppendingPathComponent:relativePath];
+    
+    BOOL isDir;
+    [NSFileManager.defaultManager fileExistsAtPath:fullPath isDirectory:&isDir];
+    
+    if (isDir) {
+        // 发送目录
+        FileEntry *dirEntry = [[FileEntry alloc] init];
+        dirEntry.type = FileEntryTypeDirectory;
+        dirEntry.path = relativePath;
+        dirEntry.isDir = YES;
+        
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:dirEntry requiringSecureCoding:YES error:nil];
+        [[TCPServerTool shareInstance] sendData:data to:@"" withTag:self.currentTag++];
+        [self sendNextFile];
+    } else {
+        // 发送文件 Start
+        FileEntry *startEntry = [[FileEntry alloc] init];
+        startEntry.type = FileEntryTypeStart;
+        startEntry.path = relativePath;
+        
+        NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:fullPath error:nil];
+        startEntry.fileSize = attrs ? [attrs fileSize] : 0;
+        
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:startEntry requiringSecureCoding:YES error:nil];
+        [[TCPServerTool shareInstance] sendData:data to:@"" withTag:self.currentTag++];
+        
+        NSFileHandle *fileHandle = [NSFileHandle fileHandleForReadingAtPath:fullPath];
+        if (fileHandle) {
+            [self.fileHandles setObject:fileHandle forKey:relativePath];
+            [self sendNextChunkForFile:relativePath];
+        } else {
+            NSLog(@"无法打开文件: %@", fullPath);
+            [self sendNextFile];
+        }
     }
 }
 
-- (void)trySendOneEntry {
-    if (self.currentTag >= self.fileEntries.count) {
-        FileEntry *endSignal = [[FileEntry alloc] init]; // 当文件数据传输完毕时，创建一个空的 WBFileEntry 对象为结束标志
-        NSData *signalData = [NSKeyedArchiver archivedDataWithRootObject:endSignal requiringSecureCoding:YES error:nil];    // 序列化结束信号
-        [[TCPServerTool shareInstance] sendData:signalData to:@"" withTag:self.currentTag];   // 发送结束信号
-        self.currentTag += 1;
+- (void)sendNextChunkForFile:(NSString *)relativePath {
+    NSFileHandle *fileHandle = [self.fileHandles objectForKey:relativePath];
+    if (!fileHandle) {
+        [self sendNextFile];
         return;
-    } else {
-        if (self.currentTag-self.sentTag <= 5) {
-            NSString *relativePath = [self.fileEntries objectAtIndex:self.currentTag];
-            NSString *fullPath = [self.sourceDirPath stringByAppendingPathComponent:relativePath];
-            FileEntry *entry = [[FileEntry alloc] init];
-            BOOL isDir;
-            [NSFileManager.defaultManager fileExistsAtPath:fullPath isDirectory:&isDir];
-            entry.isDir = isDir;
-            NSString *progressString = [NSString stringWithFormat:@"已发送:%ld/%ld",self.currentTag,self.fileEntries.count];
-            entry.path = relativePath;
-            if (entry.isDir == FALSE) {
-                entry.data = [NSData dataWithContentsOfFile:fullPath];
-            }
-            @autoreleasepool {
-                NSData *data = [NSKeyedArchiver archivedDataWithRootObject:entry requiringSecureCoding:YES error:nil];
-                [[TCPServerTool shareInstance] sendData:data to:@"" withTag:self.currentTag];
-            }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [SVProgressHUD showWithStatus:progressString];
-            });
-            self.currentTag ++;
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (self.connStatus) {
-                [self trySendOneEntry];
-            } else {
-                return;
-            }
-        });
     }
+    
+    @autoreleasepool {
+        NSData *chunkData = [fileHandle readDataOfLength:CHUNK_SIZE];
+        if (chunkData.length > 0) {
+            FileEntry *chunkEntry = [[FileEntry alloc] init];
+            chunkEntry.type = FileEntryTypeData;
+            chunkEntry.path = relativePath;
+            chunkEntry.offset = [fileHandle offsetInFile] - chunkData.length;
+            chunkEntry.chunkData = chunkData;
+            
+            [self sendDataWithEntry:chunkEntry];
+            
+            if (chunkData.length == CHUNK_SIZE) {
+                dispatch_async(self.sendingQueue, ^{
+                    [self sendNextChunkForFile:relativePath];
+                });
+            } else {
+                // 文件结束
+                [fileHandle closeFile];
+                [self.fileHandles removeObjectForKey:relativePath];
+                
+                FileEntry *endEntry = [[FileEntry alloc] init];
+                endEntry.type = FileEntryTypeEnd;
+                endEntry.path = relativePath;
+                [self sendDataWithEntry:endEntry];
+                
+                dispatch_async(self.sendingQueue, ^{
+                    [self sendNextFile];
+                });
+            }
+        } else {
+            [fileHandle closeFile];
+            [self.fileHandles removeObjectForKey:relativePath];
+            dispatch_async(self.sendingQueue, ^{
+                [self sendNextFile];
+            });
+        }
+    }
+}
+
+
+#pragma mark - Flow Control & Progress
+
+- (void)sendDataWithEntry:(FileEntry *)entry {
+    [self.condition lock];
+    while (self.currentTag - self.sentTag >= self.windowSize) {
+        [self.condition wait];
+    }
+    [self.condition unlock];
+    
+    @autoreleasepool {
+        NSData *data = [NSKeyedArchiver archivedDataWithRootObject:entry requiringSecureCoding:YES error:nil];
+        [[TCPServerTool shareInstance] sendData:data to:@"" withTag:self.currentTag];
+    }
+    
+    self.currentTag++;
+    self.sentFilesSize += entry.chunkData.length;
+    
+    float progress = self.totalFilesSize > 0 ? (float)self.sentFilesSize / (float)self.totalFilesSize : 0;
+    NSString *status = [NSString stringWithFormat:@"发送进度: %.1f%%", progress * 100];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [SVProgressHUD showProgress:progress status:status];
+    });
 }
 
 

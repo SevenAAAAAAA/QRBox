@@ -19,7 +19,7 @@ typedef NS_ENUM(NSInteger, ConnectStatus) {
 @protocol TCPServerToolDelegate <NSObject>
 
 - (void)socket:(TCPServerTool *)tool receiveData:(NSData *)contentData;
-- (void)socket:(TCPServerTool *)tool status:(ConnectStatus)status withError:(nullable NSError *)err ;;
+- (void)socket:(TCPServerTool *)tool status:(ConnectStatus)status withError:(nullable NSError *)err;
 - (void)socket:(TCPServerTool *)tool withTag:(long)tag;
 
 @end
