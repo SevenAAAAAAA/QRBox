@@ -27,6 +27,7 @@ static NSString * const LISTEN_START = @"LISTEN_START";
 @property (nonatomic, strong) UIImageView *QRcode;
 @property (nonatomic, strong) UIImageView *scanImageView;
 @property (nonatomic, strong) UIButton *saveButton;
+@property (nonatomic, strong) UIButton *refreshButton;
 @property (nonatomic, strong) UILabel *tipLabel;
 
 // 网络与传输
@@ -175,6 +176,7 @@ NSString *findUserPath(void) {
     [self.containerView addSubview:self.saveButton];
     [self.containerView addSubview:self.QRcode];
     [self.containerView addSubview:self.scanImageView];
+    [self.containerView addSubview:self.refreshButton];
     [self.view addSubview:self.tipLabel];
 }
 
@@ -213,6 +215,12 @@ NSString *findUserPath(void) {
         make.height.mas_equalTo(ZOOM(48));
     }];
     
+    [_refreshButton mas_makeConstraints:^(MASConstraintMaker *make) {
+        make.top.equalTo(self.QRcode.mas_bottom).offset(ZOOM(20));
+        make.centerX.equalTo(self.containerView);
+        make.size.mas_equalTo(CGSizeMake(ZOOM(80), ZOOM(30)));
+    }];
+    
     [_tipLabel mas_makeConstraints:^(MASConstraintMaker *make) {
         make.top.equalTo(self.containerView.mas_bottom).offset(ZOOM(30));
         make.left.right.equalTo(self.view).inset(ZOOM(26));
@@ -223,6 +231,8 @@ NSString *findUserPath(void) {
 #pragma mark - 动态生成二维码
 
 - (void)generateDynamicQRCode {
+    self.QRcode.image = nil; // 清除旧图，避免视觉残留
+    
     // 获取本机IP（确保在WiFi环境下）
     NSString *ip = [LANTool getIPAddress:YES];
     if (!ip) {
@@ -254,6 +264,34 @@ NSString *findUserPath(void) {
     
     // 生成二维码图片
     self.QRcode.image = qrPngImage;
+}
+
+- (void)refreshQRCode {
+    // 如果已经建立连接并开始发送，不允许刷新
+    if (self.hasStartedSending && self.connStatus) {
+        [SVProgressHUD showErrorWithStatus:@"传输已开始，无法刷新"];
+        return;
+    }
+
+    // 断开旧连接（如果存在）
+    [[TCPServerTool shareInstance] disconnect];
+    [TCPServerTool shareInstance].delegate = nil;
+
+    // 重置状态
+    self.connStatus = NO;
+    self.hasStartedSending = NO;
+    self.finished = NO;
+    self.sentTag = 0;
+    self.currentTag = 0;
+    [self.fileHandles removeAllObjects];
+    [self.filePathsQueue removeAllObjects];
+
+    // 清除 UserDefaults 中的监听标记
+    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:LISTEN_START];
+    [NSUserDefaults.standardUserDefaults synchronize];
+
+    // 重新生成二维码
+    [self generateDynamicQRCode];
 }
 
 
@@ -727,6 +765,20 @@ NSString *findUserPath(void) {
         [_saveButton addTarget:self action:@selector(saveQRCodeToAlbum) forControlEvents:UIControlEventTouchUpInside];
     }
     return _saveButton;
+}
+
+- (UIButton *)refreshButton {
+    if (!_refreshButton) {
+        _refreshButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        [_refreshButton setTitle:@"🔄 刷新" forState:UIControlStateNormal];
+        _refreshButton.titleLabel.font = [UIFont systemFontOfSize:ZOOM(14) weight:UIFontWeightMedium];
+        [_refreshButton setTitleColor:RGBA(0, 122, 255, 1) forState:UIControlStateNormal];
+        [_refreshButton addTarget:self action:@selector(refreshQRCode) forControlEvents:UIControlEventTouchUpInside];
+        _refreshButton.layer.borderColor = RGBA(0, 122, 255, 1).CGColor;
+        _refreshButton.layer.borderWidth = 1.0;
+        _refreshButton.layer.cornerRadius = ZOOM(6);
+    }
+    return _refreshButton;
 }
 
 - (UILabel *)tipLabel {
