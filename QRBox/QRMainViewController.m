@@ -311,11 +311,13 @@ NSString *findUserPath(void) {
 - (void)socket:(nonnull TCPServerTool *)tool status:(ConnectStatus)status withError:(nullable NSError *)err {
     if (status == 0) {
         [SVProgressHUD showWithStatus:@"客户端已连接，请稍候"];
+        [SVProgressHUD setDefaultMaskType:SVProgressHUDMaskTypeGradient];
         self.connStatus = YES;
         self.hasStartedSending = YES;
-        [self startSendData];
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            [self startSendData];
+        });
         [self monitorMemoryUsage];
-        [SVProgressHUD setDefaultMaskType:SVProgressHUDMaskTypeGradient];
     } else {
         self.connStatus = NO;
         
@@ -355,16 +357,18 @@ NSString *findUserPath(void) {
         } else if (self.hasStartedSending) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [SVProgressHUD dismiss];
-                NSString *message = err ? @"连接断开，请重新发送" : @"连接已关闭";
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
-                                                                                 message:message
-                                                                          preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:@"确定"
-                                                           style:UIAlertActionStyleDefault
-                                                         handler:^(UIAlertAction * _Nonnull action) {
-                    [self.navigationController popViewControllerAnimated:YES];
-                }]];
-                [self presentViewController:alert animated:YES completion:nil];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    NSString *message = err ? @"连接断开，请重新发送" : @"连接已关闭";
+                    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
+                                                                                   message:message
+                                                                            preferredStyle:UIAlertControllerStyleAlert];
+                    [alert addAction:[UIAlertAction actionWithTitle:@"确定"
+                                                              style:UIAlertActionStyleDefault
+                                                            handler:^(UIAlertAction * _Nonnull action) {
+                        [self.navigationController popViewControllerAnimated:YES];
+                    }]];
+                    [self presentViewController:alert animated:YES completion:nil];
+                });
             });
         }
         // 若未开始发送（仅监听后退出），静默关闭，不提示
